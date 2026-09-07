@@ -1,7 +1,10 @@
-from flask import Flask, request, jsonify, Response, stream_with_context
+from flask import Flask, request, jsonify, Response, stream_with_context, send_file
 import yt_dlp
 import requests
 import os
+import tempfile
+import glob
+import shutil
 from urllib.parse import urlparse
 
 app = Flask(__name__)
@@ -26,6 +29,16 @@ def is_valid_instagram_url(url):
 
     except Exception:
         return False
+
+
+COMMON_HEADERS = {
+    "Referer": "https://www.instagram.com/",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/138.0.0.0 Safari/537.36"
+    ),
+}
 
 
 @app.after_request
@@ -73,14 +86,7 @@ def resolve_instagram():
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
-        "http_headers": {
-            "Referer": "https://www.instagram.com/",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/138.0.0.0 Safari/537.36"
-            ),
-        },
+        "http_headers": COMMON_HEADERS,
     }
 
     try:
@@ -97,7 +103,6 @@ def resolve_instagram():
 
         return jsonify({
             "success": True,
-            "type": "video",
             "title": info.get("title"),
             "thumbnail": info.get("thumbnail"),
             "duration": info.get("duration"),
@@ -119,6 +124,7 @@ def resolve_instagram():
 def download_instagram():
 
     url = (request.args.get("url") or "").strip()
+    file_format = (request.args.get("format") or "mp3").lower()
 
     if not url:
         return jsonify({
@@ -132,74 +138,133 @@ def download_instagram():
             "message": "Invalid Instagram URL."
         }), 400
 
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True,
-        "http_headers": {
-            "Referer": "https://www.instagram.com/",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/138.0.0.0 Safari/537.36"
-            ),
-        },
-    }
+    if file_format not in {"mp3", "mp4"}:
+        return jsonify({
+            "success": False,
+            "message": "Unsupported format."
+        }), 400
+
+    temp_dir = None
 
     try:
+
+        if file_format == "mp4":
+
+            ydl_opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "skip_download": True,
+                "noplaylist": True,
+                "http_headers": COMMON_HEADERS,
+            }
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+
+            media_url = info.get("url")
+
+            if not media_url:
+                return jsonify({
+                    "success": False,
+                    "message": "No downloadable video was found."
+                }), 404
+
+            media_headers = info.get("http_headers", {})
+
+            upstream = requests.get(
+                media_url,
+                headers=media_headers,
+                stream=True,
+                timeout=60
+            )
+
+            upstream.raise_for_status()
+
+            content_type = (
+                upstream.headers.get("Content-Type")
+                or "video/mp4"
+            )
+
+            def generate():
+                try:
+                    for chunk in upstream.iter_content(
+                        chunk_size=1024 * 256
+                    ):
+                        if chunk:
+                            yield chunk
+                finally:
+                    upstream.close()
+
+            response = Response(
+                stream_with_context(generate()),
+                content_type=content_type
+            )
+
+            response.headers["Content-Disposition"] = (
+                'attachment; filename="instagram-video.mp4"'
+            )
+
+            return response
+
+        # MP3
+        temp_dir = tempfile.mkdtemp(prefix="instagram_")
+
+        output_template = os.path.join(
+            temp_dir,
+            "instagram_audio.%(ext)s"
+        )
+
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "format": "bestaudio/best",
+            "outtmpl": output_template,
+            "http_headers": COMMON_HEADERS,
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ],
+        }
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            ydl.download([url])
 
-        media_url = info.get("url")
-
-        if not media_url:
-            return jsonify({
-                "success": False,
-                "message": "No downloadable media found."
-            }), 404
-
-        media_headers = info.get("http_headers", {})
-
-        upstream = requests.get(
-            media_url,
-            headers=media_headers,
-            stream=True,
-            timeout=60
+        mp3_files = glob.glob(
+            os.path.join(temp_dir, "*.mp3")
         )
 
-        upstream.raise_for_status()
+        if not mp3_files:
+            raise RuntimeError("MP3 file was not created.")
 
-        content_type = (
-            upstream.headers.get("Content-Type")
-            or "application/octet-stream"
+        mp3_file = mp3_files[0]
+
+        response = send_file(
+            mp3_file,
+            mimetype="audio/mpeg",
+            as_attachment=True,
+            download_name="instagram-audio.mp3"
         )
 
-        filename = "instagram-media.mp4"
-
-        def generate():
-            try:
-                for chunk in upstream.iter_content(chunk_size=1024 * 256):
-                    if chunk:
-                        yield chunk
-            finally:
-                upstream.close()
-
-        response = Response(
-            stream_with_context(generate()),
-            content_type=content_type
-        )
-
-        response.headers["Content-Disposition"] = (
-            f'attachment; filename="{filename}"'
-        )
+        @response.call_on_close
+        def cleanup():
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
         return response
 
     except Exception:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
         return jsonify({
             "success": False,
-            "message": "Media download failed. Please try again."
+            "message": (
+                "Download failed. The media may be unavailable "
+                "or temporarily unsupported."
+            )
         }), 400
 
 
