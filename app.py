@@ -5,6 +5,7 @@ import os
 import tempfile
 import glob
 import shutil
+import subprocess
 from urllib.parse import urlparse
 
 app = Flask(__name__)
@@ -13,6 +14,15 @@ ALLOWED_HOSTS = {
     "instagram.com",
     "www.instagram.com",
     "m.instagram.com",
+}
+
+COMMON_HEADERS = {
+    "Referer": "https://www.instagram.com/",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/138.0.0.0 Safari/537.36"
+    ),
 }
 
 
@@ -29,16 +39,6 @@ def is_valid_instagram_url(url):
 
     except Exception:
         return False
-
-
-COMMON_HEADERS = {
-    "Referer": "https://www.instagram.com/",
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/138.0.0.0 Safari/537.36"
-    ),
-}
 
 
 @app.after_request
@@ -144,130 +144,178 @@ def download_instagram():
             "message": "Unsupported format."
         }), 400
 
-    temp_dir = None
+    if not shutil.which("ffmpeg"):
+        return jsonify({
+            "success": False,
+            "message": "FFmpeg is not available on the server."
+        }), 500
+
+    temp_dir = tempfile.mkdtemp(prefix="instagram_")
 
     try:
 
+        # -------------------------
+        # MP4
+        # -------------------------
         if file_format == "mp4":
 
             ydl_opts = {
                 "quiet": True,
                 "no_warnings": True,
-                "skip_download": True,
                 "noplaylist": True,
+                "format": "best[acodec!=none]/best",
+                "outtmpl": os.path.join(
+                    temp_dir,
+                    "instagram_video.%(ext)s"
+                ),
                 "http_headers": COMMON_HEADERS,
             }
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
+                ydl.download([url])
 
-            media_url = info.get("url")
+            video_files = [
+                f for f in glob.glob(
+                    os.path.join(temp_dir, "*")
+                )
+                if not f.lower().endswith(".part")
+            ]
 
-            if not media_url:
-                return jsonify({
-                    "success": False,
-                    "message": "No downloadable video was found."
-                }), 404
+            if not video_files:
+                raise RuntimeError("Video file was not created.")
 
-            media_headers = info.get("http_headers", {})
+            video_file = video_files[0]
 
-            upstream = requests.get(
-                media_url,
-                headers=media_headers,
-                stream=True,
-                timeout=60
+            response = send_file(
+                video_file,
+                mimetype="video/mp4",
+                as_attachment=True,
+                download_name="instagram-video.mp4"
             )
 
-            upstream.raise_for_status()
-
-            content_type = (
-                upstream.headers.get("Content-Type")
-                or "video/mp4"
-            )
-
-            def generate():
-                try:
-                    for chunk in upstream.iter_content(
-                        chunk_size=1024 * 256
-                    ):
-                        if chunk:
-                            yield chunk
-                finally:
-                    upstream.close()
-
-            response = Response(
-                stream_with_context(generate()),
-                content_type=content_type
-            )
-
-            response.headers["Content-Disposition"] = (
-                'attachment; filename="instagram-video.mp4"'
-            )
-
-            return response
-
+        # -------------------------
         # MP3
-        temp_dir = tempfile.mkdtemp(prefix="instagram_")
+        # -------------------------
+        else:
 
-        output_template = os.path.join(
-            temp_dir,
-            "instagram_audio.%(ext)s"
-        )
+            audio_input = os.path.join(
+                temp_dir,
+                "instagram_audio.%(ext)s"
+            )
 
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "format": "bestaudio/best",
-            "outtmpl": output_template,
-            "http_headers": COMMON_HEADERS,
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }
-            ],
-        }
+            ydl_opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "format": "best[acodec!=none]/bestaudio/best",
+                "outtmpl": audio_input,
+                "http_headers": COMMON_HEADERS,
+            }
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
 
-        mp3_files = glob.glob(
-            os.path.join(temp_dir, "*.mp3")
-        )
+            downloaded_files = [
+                f for f in glob.glob(
+                    os.path.join(temp_dir, "*")
+                )
+                if (
+                    os.path.isfile(f)
+                    and not f.endswith(".part")
+                    and not f.endswith(".mp3")
+                )
+            ]
 
-        if not mp3_files:
-            raise RuntimeError("MP3 file was not created.")
+            if not downloaded_files:
+                raise RuntimeError(
+                    "Audio-capable media was not downloaded."
+                )
 
-        mp3_file = mp3_files[0]
+            source_file = downloaded_files[0]
 
-        response = send_file(
-            mp3_file,
-            mimetype="audio/mpeg",
-            as_attachment=True,
-            download_name="instagram-audio.mp3"
-        )
+            mp3_file = os.path.join(
+                temp_dir,
+                "instagram-audio.mp3"
+            )
+
+            ffmpeg_command = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                source_file,
+                "-vn",
+                "-acodec",
+                "libmp3lame",
+                "-b:a",
+                "192k",
+                mp3_file,
+            ]
+
+            process = subprocess.run(
+                ffmpeg_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=120,
+            )
+
+            if process.returncode != 0:
+                raise RuntimeError(
+                    process.stderr[-3000:]
+                )
+
+            if not os.path.exists(mp3_file):
+                raise RuntimeError(
+                    "MP3 file was not created."
+                )
+
+            response = send_file(
+                mp3_file,
+                mimetype="audio/mpeg",
+                as_attachment=True,
+                download_name="instagram-audio.mp3"
+            )
 
         @response.call_on_close
         def cleanup():
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            shutil.rmtree(
+                temp_dir,
+                ignore_errors=True
+            )
 
         return response
 
-    except Exception:
-        if temp_dir:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True
+        )
 
         return jsonify({
             "success": False,
-            "message": (
-                "Download failed. The media may be unavailable "
-                "or temporarily unsupported."
-            )
+            "message": "MP3 conversion timed out."
+        }), 500
+
+    except Exception as e:
+
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True
+        )
+
+        return jsonify({
+            "success": False,
+            "message": "Download failed.",
+            "error": str(e)
         }), 400
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    port = int(
+        os.environ.get("PORT", 10000)
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
