@@ -1,6 +1,5 @@
-from flask import Flask, request, jsonify, Response, stream_with_context, send_file
+from flask import Flask, request, jsonify, Response, send_file
 import yt_dlp
-import requests
 import os
 import tempfile
 import glob
@@ -30,15 +29,71 @@ def is_valid_instagram_url(url):
     try:
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower()
+        path = parsed.path or ""
 
         return (
             parsed.scheme in {"http", "https"}
             and host in ALLOWED_HOSTS
-            and parsed.path.startswith(("/p/", "/reel/", "/tv/"))
+            and (
+                path.startswith("/p/")
+                or path.startswith("/reel/")
+                or path.startswith("/tv/")
+            )
         )
 
     except Exception:
         return False
+
+
+def get_ydl_info(url):
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "http_headers": COMMON_HEADERS,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def choose_audio_format(info):
+    formats = info.get("formats") or []
+
+    audio_formats = []
+
+    for fmt in formats:
+        acodec = fmt.get("acodec")
+        media_url = fmt.get("url")
+
+        if (
+            media_url
+            and acodec
+            and acodec != "none"
+        ):
+            audio_formats.append(fmt)
+
+    if not audio_formats:
+        return None
+
+    def audio_score(fmt):
+        abr = fmt.get("abr")
+        tbr = fmt.get("tbr")
+        asr = fmt.get("asr")
+
+        return (
+            float(abr or 0),
+            float(tbr or 0),
+            int(asr or 0),
+        )
+
+    audio_formats.sort(
+        key=audio_score,
+        reverse=True
+    )
+
+    return audio_formats[0]
 
 
 @app.after_request
@@ -65,9 +120,16 @@ def resolve_instagram():
 
     if request.method == "POST":
         data = request.get_json(silent=True) or {}
-        url = (data.get("url") or request.form.get("url") or "").strip()
+        url = (
+            data.get("url")
+            or request.form.get("url")
+            or ""
+        ).strip()
     else:
-        url = (request.args.get("url") or "").strip()
+        url = (
+            request.args.get("url")
+            or ""
+        ).strip()
 
     if not url:
         return jsonify({
@@ -78,22 +140,36 @@ def resolve_instagram():
     if not is_valid_instagram_url(url):
         return jsonify({
             "success": False,
-            "message": "Please enter a valid public Instagram post or Reel URL."
+            "message": (
+                "Please enter a valid public Instagram "
+                "post or Reel URL."
+            )
         }), 400
 
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True,
-        "http_headers": COMMON_HEADERS,
-    }
-
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        info = get_ydl_info(url)
+
+        formats = info.get("formats") or []
 
         media_url = info.get("url")
+
+        # If the main URL is missing, find a usable format.
+        if not media_url:
+            usable = [
+                f for f in formats
+                if f.get("url")
+                and (
+                    f.get("vcodec") != "none"
+                    or f.get("acodec") != "none"
+                )
+            ]
+
+            if usable:
+                usable.sort(
+                    key=lambda f: float(f.get("tbr") or 0),
+                    reverse=True
+                )
+                media_url = usable[0].get("url")
 
         if not media_url:
             return jsonify({
@@ -115,7 +191,8 @@ def resolve_instagram():
             "success": False,
             "message": (
                 "Could not resolve this Instagram media. "
-                "The post may be private, unavailable, or temporarily unsupported."
+                "The post may be private, unavailable, "
+                "or temporarily unsupported."
             )
         }), 400
 
@@ -123,8 +200,15 @@ def resolve_instagram():
 @app.route("/api/download", methods=["GET"])
 def download_instagram():
 
-    url = (request.args.get("url") or "").strip()
-    file_format = (request.args.get("format") or "mp3").lower()
+    url = (
+        request.args.get("url")
+        or ""
+    ).strip()
+
+    file_format = (
+        request.args.get("format")
+        or "mp3"
+    ).lower()
 
     if not url:
         return jsonify({
@@ -150,101 +234,137 @@ def download_instagram():
             "message": "FFmpeg is not available on the server."
         }), 500
 
-    temp_dir = tempfile.mkdtemp(prefix="instagram_")
+    temp_dir = tempfile.mkdtemp(
+        prefix="instagram_"
+    )
 
     try:
 
-        # -------------------------
+        # =====================================
         # MP4
-        # -------------------------
+        # =====================================
+
         if file_format == "mp4":
+
+            output_template = os.path.join(
+                temp_dir,
+                "instagram-video.%(ext)s"
+            )
 
             ydl_opts = {
                 "quiet": True,
                 "no_warnings": True,
                 "noplaylist": True,
-                "format": "best[acodec!=none]/best",
-                "outtmpl": os.path.join(
-                    temp_dir,
-                    "instagram_video.%(ext)s"
-                ),
+
+                # Best video+audio where possible,
+                # with combined-format fallback.
+                "format": "bv*+ba/b",
+
+                "merge_output_format": "mp4",
+
+                "outtmpl": output_template,
+
                 "http_headers": COMMON_HEADERS,
             }
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
 
-            video_files = [
-                f for f in glob.glob(
-                    os.path.join(temp_dir, "*")
+            mp4_files = glob.glob(
+                os.path.join(
+                    temp_dir,
+                    "*.mp4"
                 )
-                if not f.lower().endswith(".part")
-            ]
+            )
 
-            if not video_files:
-                raise RuntimeError("Video file was not created.")
+            if not mp4_files:
+                raise RuntimeError(
+                    "MP4 file was not created."
+                )
 
-            video_file = video_files[0]
+            mp4_file = mp4_files[0]
 
             response = send_file(
-                video_file,
+                mp4_file,
                 mimetype="video/mp4",
                 as_attachment=True,
                 download_name="instagram-video.mp4"
             )
 
-        # -------------------------
+        # =====================================
         # MP3
-        # -------------------------
+        # =====================================
+
         else:
 
-            audio_input = os.path.join(
+            # First inspect the available formats.
+            info = get_ydl_info(url)
+
+            audio_format = choose_audio_format(info)
+
+            if not audio_format:
+                raise RuntimeError(
+                    "No audio-capable Instagram format was found."
+                )
+
+            format_id = audio_format.get(
+                "format_id"
+            )
+
+            if not format_id:
+                raise RuntimeError(
+                    "Audio format ID was not available."
+                )
+
+            source_template = os.path.join(
                 temp_dir,
-                "instagram_audio.%(ext)s"
+                "instagram-source.%(ext)s"
             )
 
             ydl_opts = {
                 "quiet": True,
                 "no_warnings": True,
                 "noplaylist": True,
-                "format": "best[acodec!=none]/bestaudio/best",
-                "outtmpl": audio_input,
+                "format": str(format_id),
+                "outtmpl": source_template,
                 "http_headers": COMMON_HEADERS,
             }
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
 
-            downloaded_files = [
+            source_files = [
                 f for f in glob.glob(
                     os.path.join(temp_dir, "*")
                 )
                 if (
                     os.path.isfile(f)
                     and not f.endswith(".part")
-                    and not f.endswith(".mp3")
                 )
             ]
 
-            if not downloaded_files:
+            if not source_files:
                 raise RuntimeError(
-                    "Audio-capable media was not downloaded."
+                    "Audio source was not downloaded."
                 )
 
-            source_file = downloaded_files[0]
+            source_file = source_files[0]
 
             mp3_file = os.path.join(
                 temp_dir,
                 "instagram-audio.mp3"
             )
 
+            # Extract audio directly with FFmpeg.
             ffmpeg_command = [
                 "ffmpeg",
                 "-y",
                 "-i",
                 source_file,
+                "-map",
+                "0:a:0",
                 "-vn",
-                "-acodec",
+                "-codec:a",
                 "libmp3lame",
                 "-b:a",
                 "192k",
@@ -261,7 +381,7 @@ def download_instagram():
 
             if process.returncode != 0:
                 raise RuntimeError(
-                    process.stderr[-3000:]
+                    process.stderr[-4000:]
                 )
 
             if not os.path.exists(mp3_file):
@@ -286,6 +406,7 @@ def download_instagram():
         return response
 
     except subprocess.TimeoutExpired:
+
         shutil.rmtree(
             temp_dir,
             ignore_errors=True
@@ -293,7 +414,7 @@ def download_instagram():
 
         return jsonify({
             "success": False,
-            "message": "MP3 conversion timed out."
+            "message": "Audio conversion timed out."
         }), 500
 
     except Exception as e:
@@ -311,8 +432,12 @@ def download_instagram():
 
 
 if __name__ == "__main__":
+
     port = int(
-        os.environ.get("PORT", 10000)
+        os.environ.get(
+            "PORT",
+            10000
+        )
     )
 
     app.run(
