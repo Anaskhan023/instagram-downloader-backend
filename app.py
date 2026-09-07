@@ -33,11 +33,11 @@ def home():
     })
 
 
-@app.route("/api/resolve", methods=["POST"])
+@app.route("/api/resolve", methods=["GET", "POST"])
 def resolve_instagram():
 
     data = request.get_json(silent=True) or {}
-    url = (data.get("url") or "").strip()
+    url = (data.get("url") or request.args.get("url") or "").strip()
 
     if not url:
         return jsonify({
