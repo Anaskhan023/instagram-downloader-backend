@@ -9,7 +9,9 @@ import time
 import hmac
 import hashlib
 import logging
+import threading
 from urllib.parse import urlparse
+from collections import OrderedDict
 
 app = Flask(__name__)
 
@@ -37,11 +39,41 @@ BACKEND_API_SECRET = os.environ.get(
     ""
 )
 
+# WordPress / API request protection
 RATE_WINDOW = 60
 MAX_REQUESTS_PER_WINDOW = 12
+
+# Secure download URL lifetime
 DOWNLOAD_TOKEN_TTL = 180
 
+# Cache successful Instagram metadata briefly.
+# This is NOT used to bypass Instagram restrictions.
+RESOLVE_CACHE_TTL = 120
+RESOLVE_CACHE_MAX_ITEMS = 100
+
+# Keep only a small number of Instagram resolves active
+# at once. This reduces bursts against Instagram.
+MAX_CONCURRENT_RESOLVES = 2
+
+# Limited retries for temporary upstream failures.
+MAX_RESOLVE_RETRIES = 2
+
+# Small starting delay for 429/temporary errors.
+RETRY_BASE_DELAY = 2
+
+
+# =========================================================
+# STATE
+# =========================================================
+
 request_log = {}
+
+resolve_cache = OrderedDict()
+resolve_cache_lock = threading.Lock()
+
+resolve_semaphore = threading.Semaphore(
+    MAX_CONCURRENT_RESOLVES
+)
 
 
 # =========================================================
@@ -61,11 +93,18 @@ logger = logging.getLogger(__name__)
 # =========================================================
 
 def get_client_ip():
+    """
+    Return the direct client IP seen by Flask.
+
+    Note:
+    Behind a reverse proxy this may be the proxy IP unless
+    the deployment is explicitly configured to trust forwarded
+    headers. We intentionally do not blindly trust X-Forwarded-For.
+    """
     return request.remote_addr or "unknown"
 
 
 def cleanup_rate_log():
-
     now = time.time()
 
     expired = [
@@ -79,25 +118,37 @@ def cleanup_rate_log():
         request_log.pop(ip, None)
 
 
-def rate_limit_ok():
+def rate_limit_ok(
+    action="default",
+    max_requests=12,
+    window=60
+):
+    """
+    In-memory rate limiter.
+
+    This limits requests seen by this Render instance.
+    It is not a substitute for Instagram's own limits.
+    """
 
     cleanup_rate_log()
 
     ip = get_client_ip()
     now = time.time()
 
+    key = f"{ip}|{action}"
+
     timestamps = request_log.setdefault(
-        ip,
+        key,
         []
     )
 
     timestamps[:] = [
         ts
         for ts in timestamps
-        if ts > now - RATE_WINDOW
+        if ts > now - window
     ]
 
-    if len(timestamps) >= MAX_REQUESTS_PER_WINDOW:
+    if len(timestamps) >= max_requests:
         return False
 
     timestamps.append(now)
@@ -106,7 +157,6 @@ def rate_limit_ok():
 
 
 def is_authorized_server_request():
-
     if not BACKEND_API_SECRET:
         logger.error(
             "BACKEND_API_SECRET is missing."
@@ -125,7 +175,6 @@ def is_authorized_server_request():
 
 
 def unauthorized():
-
     return jsonify({
         "success": False,
         "message": "Unauthorized request."
@@ -133,7 +182,6 @@ def unauthorized():
 
 
 def too_many_requests():
-
     return jsonify({
         "success": False,
         "message": (
@@ -150,7 +198,6 @@ def too_many_requests():
 def is_valid_instagram_url(url):
 
     try:
-
         parsed = urlparse(url)
 
         host = (
@@ -181,12 +228,82 @@ def is_valid_instagram_url(url):
 
 
 # =========================================================
-# YT-DLP INFO
+# CACHE HELPERS
 # =========================================================
 
-def get_ydl_info(url):
+def cache_key(url):
+    return url.strip()
 
-    ydl_opts = {
+
+def get_cached_resolve(url):
+
+    key = cache_key(url)
+    now = time.time()
+
+    with resolve_cache_lock:
+
+        item = resolve_cache.get(key)
+
+        if not item:
+            return None
+
+        expires_at = item.get(
+            "expires_at",
+            0
+        )
+
+        if expires_at <= now:
+            resolve_cache.pop(
+                key,
+                None
+            )
+            return None
+
+        # Move recently used item to end.
+        resolve_cache.move_to_end(
+            key
+        )
+
+        # Return a copy so callers cannot mutate cache state.
+        return dict(
+            item["data"]
+        )
+
+
+def set_cached_resolve(
+    url,
+    data
+):
+
+    key = cache_key(url)
+
+    with resolve_cache_lock:
+
+        resolve_cache[key] = {
+            "expires_at": (
+                time.time()
+                + RESOLVE_CACHE_TTL
+            ),
+            "data": dict(data)
+        }
+
+        resolve_cache.move_to_end(
+            key
+        )
+
+        while len(resolve_cache) > RESOLVE_CACHE_MAX_ITEMS:
+            resolve_cache.popitem(
+                last=False
+            )
+
+
+# =========================================================
+# YT-DLP
+# =========================================================
+
+def create_ydl_info_options():
+
+    return {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
@@ -197,6 +314,11 @@ def get_ydl_info(url):
         "socket_timeout": 20,
     }
 
+
+def get_ydl_info(url):
+
+    ydl_opts = create_ydl_info_options()
+
     with yt_dlp.YoutubeDL(
         ydl_opts
     ) as ydl:
@@ -205,6 +327,78 @@ def get_ydl_info(url):
             url,
             download=False
         )
+
+
+def is_probable_rate_limit_error(error):
+    """
+    Detect common 429/rate-limit messages without
+    depending on one exact yt-dlp exception string.
+    """
+
+    text = str(error).lower()
+
+    indicators = [
+        "http error 429",
+        "too many requests",
+        "rate limit",
+        "rate-limit",
+        "temporarily blocked",
+    ]
+
+    return any(
+        item in text
+        for item in indicators
+    )
+
+
+def resolve_with_retry(url):
+
+    last_error = None
+
+    for attempt in range(
+        MAX_RESOLVE_RETRIES + 1
+    ):
+
+        try:
+            return get_ydl_info(
+                url
+            )
+
+        except Exception as error:
+
+            last_error = error
+
+            if not is_probable_rate_limit_error(
+                error
+            ):
+                raise
+
+            if attempt >= MAX_RESOLVE_RETRIES:
+                break
+
+            delay = (
+                RETRY_BASE_DELAY
+                * (2 ** attempt)
+            )
+
+            logger.warning(
+                "Temporary Instagram rate-limit "
+                "response. Retry %s/%s after %ss.",
+                attempt + 1,
+                MAX_RESOLVE_RETRIES,
+                delay
+            )
+
+            time.sleep(
+                delay
+            )
+
+    if last_error:
+        raise last_error
+
+    raise RuntimeError(
+        "Instagram resolve failed."
+    )
 
 
 # =========================================================
@@ -230,27 +424,38 @@ def choose_audio_format(info):
             and acodec
             and acodec != "none"
         ):
-            candidates.append(fmt)
+            candidates.append(
+                fmt
+            )
 
     if not candidates:
         return None
 
     def audio_score(fmt):
 
-        abr = float(
-            fmt.get("abr")
-            or 0
-        )
+        try:
+            abr = float(
+                fmt.get("abr")
+                or 0
+            )
+        except Exception:
+            abr = 0
 
-        tbr = float(
-            fmt.get("tbr")
-            or 0
-        )
+        try:
+            tbr = float(
+                fmt.get("tbr")
+                or 0
+            )
+        except Exception:
+            tbr = 0
 
-        asr = int(
-            fmt.get("asr")
-            or 0
-        )
+        try:
+            asr = int(
+                fmt.get("asr")
+                or 0
+            )
+        except Exception:
+            asr = 0
 
         return (
             abr,
@@ -281,16 +486,26 @@ def verify_download_signature(
         return False
 
     try:
-        expires_int = int(expires)
-    except (TypeError, ValueError):
+        expires_int = int(
+            expires
+        )
+    except (
+        TypeError,
+        ValueError
+    ):
         return False
 
-    now = int(time.time())
+    now = int(
+        time.time()
+    )
 
     if expires_int < now:
         return False
 
-    if expires_int > now + DOWNLOAD_TOKEN_TTL + 30:
+    if (
+        expires_int
+        > now + DOWNLOAD_TOKEN_TTL + 30
+    ):
         return False
 
     message = (
@@ -302,8 +517,12 @@ def verify_download_signature(
     )
 
     expected_signature = hmac.new(
-        BACKEND_API_SECRET.encode("utf-8"),
-        message.encode("utf-8"),
+        BACKEND_API_SECRET.encode(
+            "utf-8"
+        ),
+        message.encode(
+            "utf-8"
+        ),
         hashlib.sha256
     ).hexdigest()
 
@@ -336,9 +555,10 @@ def add_security_headers(response):
         "Cache-Control"
     ] = "no-store"
 
+    # Updated for SaveVori
     response.headers[
         "Access-Control-Allow-Origin"
-    ] = "https://badshashoes.store"
+    ] = "https://savevori.com"
 
     response.headers[
         "Access-Control-Allow-Methods"
@@ -390,6 +610,10 @@ def resolve_instagram():
             status=204
         )
 
+    # -----------------------------------------------------
+    # SECRET
+    # -----------------------------------------------------
+
     if not is_authorized_server_request():
 
         logger.warning(
@@ -399,8 +623,28 @@ def resolve_instagram():
 
         return unauthorized()
 
-    if not rate_limit_ok():
+
+    # -----------------------------------------------------
+    # API RATE LIMIT
+    # -----------------------------------------------------
+
+    if not rate_limit_ok(
+        action="resolve",
+        max_requests=12,
+        window=60
+    ):
+
+        logger.warning(
+            "Resolve rate limit exceeded for %s",
+            get_client_ip()
+        )
+
         return too_many_requests()
+
+
+    # -----------------------------------------------------
+    # GET URL
+    # -----------------------------------------------------
 
     if request.method == "POST":
 
@@ -424,6 +668,11 @@ def resolve_instagram():
             or ""
         ).strip()
 
+
+    # -----------------------------------------------------
+    # BASIC VALIDATION
+    # -----------------------------------------------------
+
     if not url:
 
         return jsonify({
@@ -432,6 +681,7 @@ def resolve_instagram():
                 "Please enter an Instagram URL."
             )
         }), 400
+
 
     if len(url) > 1000:
 
@@ -442,7 +692,10 @@ def resolve_instagram():
             )
         }), 400
 
-    if not is_valid_instagram_url(url):
+
+    if not is_valid_instagram_url(
+        url
+    ):
 
         return jsonify({
             "success": False,
@@ -452,19 +705,102 @@ def resolve_instagram():
             )
         }), 400
 
+
+    # -----------------------------------------------------
+    # CACHE
+    # -----------------------------------------------------
+
+    cached = get_cached_resolve(
+        url
+    )
+
+    if cached:
+
+        logger.info(
+            "Serving cached resolve result."
+        )
+
+        return jsonify(
+            cached
+        ), 200
+
+
+    # -----------------------------------------------------
+    # CONCURRENCY CONTROL
+    # -----------------------------------------------------
+
+    acquired = resolve_semaphore.acquire(
+        timeout=30
+    )
+
+    if not acquired:
+
+        logger.warning(
+            "Resolve concurrency limit reached."
+        )
+
+        return jsonify({
+            "success": False,
+            "message": (
+                "The service is busy right now. "
+                "Please try again in a moment."
+            )
+        }), 503
+
+
     try:
 
         logger.info(
             "Resolving Instagram URL."
         )
 
-        info = get_ydl_info(
-            url
-        )
+
+        # -------------------------------------------------
+        # RESOLVE WITH LIMITED RETRIES
+        # -------------------------------------------------
+
+        try:
+
+            info = resolve_with_retry(
+                url
+            )
+
+        except Exception as error:
+
+            logger.exception(
+                "Instagram resolve failed."
+            )
+
+            if is_probable_rate_limit_error(
+                error
+            ):
+
+                return jsonify({
+                    "success": False,
+                    "message": (
+                        "Instagram is temporarily "
+                        "limiting requests. "
+                        "Please try again later."
+                    )
+                }), 429
+
+            return jsonify({
+                "success": False,
+                "message": (
+                    "This public media "
+                    "could not be processed."
+                )
+            }), 400
+
+
+        # -------------------------------------------------
+        # MEDIA URL
+        # -------------------------------------------------
 
         media_url = info.get(
             "url"
         )
+
 
         if not media_url:
 
@@ -498,6 +834,7 @@ def resolve_instagram():
                     "url"
                 )
 
+
         if not media_url:
 
             logger.warning(
@@ -511,29 +848,48 @@ def resolve_instagram():
                 )
             }), 404
 
-        return jsonify({
+
+        # -------------------------------------------------
+        # BUILD RESPONSE
+        # -------------------------------------------------
+
+        result = {
             "success": True,
-            "title": info.get("title"),
-            "thumbnail": info.get("thumbnail"),
-            "duration": info.get("duration"),
+            "title": (
+                info.get("title")
+                or "Instagram Media"
+            ),
+            "thumbnail": info.get(
+                "thumbnail"
+            ),
+            "duration": info.get(
+                "duration"
+            ),
             "media_url": media_url,
             "message": (
                 "Instagram media resolved successfully."
             )
-        })
+        }
 
-    except Exception:
 
-        logger.exception(
-            "Instagram resolve failed."
+        # -------------------------------------------------
+        # CACHE
+        # -------------------------------------------------
+
+        set_cached_resolve(
+            url,
+            result
         )
 
-        return jsonify({
-            "success": False,
-            "message": (
-                "This public media could not be processed."
-            )
-        }), 400
+
+        return jsonify(
+            result
+        ), 200
+
+
+    finally:
+
+        resolve_semaphore.release()
 
 
 # =========================================================
@@ -550,6 +906,7 @@ def download_instagram():
         "Download request received."
     )
 
+
     # -----------------------------------------------------
     # SECRET
     # -----------------------------------------------------
@@ -564,10 +921,14 @@ def download_instagram():
 
 
     # -----------------------------------------------------
-    # RATE LIMIT
+    # DOWNLOAD RATE LIMIT
     # -----------------------------------------------------
 
-    if not rate_limit_ok():
+    if not rate_limit_ok(
+        action="download",
+        max_requests=8,
+        window=60
+    ):
 
         logger.warning(
             "Download rate limit exceeded."
@@ -585,15 +946,18 @@ def download_instagram():
         or ""
     ).strip()
 
+
     file_format = (
         request.args.get("format")
         or "mp3"
     ).lower()
 
+
     expires = (
         request.args.get("expires")
         or ""
     )
+
 
     signature = (
         request.args.get("signature")
@@ -613,7 +977,9 @@ def download_instagram():
         }), 400
 
 
-    if not is_valid_instagram_url(url):
+    if not is_valid_instagram_url(
+        url
+    ):
 
         logger.warning(
             "Invalid Instagram URL in download."
@@ -708,10 +1074,12 @@ def download_instagram():
                 "Starting MP4 download."
             )
 
+
             output_template = os.path.join(
                 temp_dir,
                 "instagram-video.%(ext)s"
             )
+
 
             ydl_opts = {
 
@@ -737,13 +1105,42 @@ def download_instagram():
             }
 
 
-            with yt_dlp.YoutubeDL(
-                ydl_opts
-            ) as ydl:
+            try:
 
-                ydl.download([
-                    url
-                ])
+                with yt_dlp.YoutubeDL(
+                    ydl_opts
+                ) as ydl:
+
+                    ydl.download([
+                        url
+                    ])
+
+            except Exception as error:
+
+                logger.exception(
+                    "MP4 download failed."
+                )
+
+                if is_probable_rate_limit_error(
+                    error
+                ):
+
+                    return jsonify({
+                        "success": False,
+                        "message": (
+                            "Instagram is temporarily "
+                            "limiting requests. "
+                            "Please try again later."
+                        )
+                    }), 429
+
+                return jsonify({
+                    "success": False,
+                    "message": (
+                        "Video download failed. "
+                        "Please try again later."
+                    )
+                }), 400
 
 
             mp4_files = glob.glob(
@@ -787,9 +1184,40 @@ def download_instagram():
                 "Starting MP3 processing."
             )
 
-            info = get_ydl_info(
-                url
-            )
+
+            # First resolve metadata.
+            try:
+
+                info = resolve_with_retry(
+                    url
+                )
+
+            except Exception as error:
+
+                logger.exception(
+                    "MP3 resolve failed."
+                )
+
+                if is_probable_rate_limit_error(
+                    error
+                ):
+
+                    return jsonify({
+                        "success": False,
+                        "message": (
+                            "Instagram is temporarily "
+                            "limiting requests. "
+                            "Please try again later."
+                        )
+                    }), 429
+
+                return jsonify({
+                    "success": False,
+                    "message": (
+                        "Audio could not be processed."
+                    )
+                }), 400
+
 
             audio_format = (
                 choose_audio_format(
@@ -864,13 +1292,42 @@ def download_instagram():
             }
 
 
-            with yt_dlp.YoutubeDL(
-                ydl_opts
-            ) as ydl:
+            try:
 
-                ydl.download([
-                    url
-                ])
+                with yt_dlp.YoutubeDL(
+                    ydl_opts
+                ) as ydl:
+
+                    ydl.download([
+                        url
+                    ])
+
+            except Exception as error:
+
+                logger.exception(
+                    "Audio source download failed."
+                )
+
+                if is_probable_rate_limit_error(
+                    error
+                ):
+
+                    return jsonify({
+                        "success": False,
+                        "message": (
+                            "Instagram is temporarily "
+                            "limiting requests. "
+                            "Please try again later."
+                        )
+                    }), 429
+
+                return jsonify({
+                    "success": False,
+                    "message": (
+                        "Audio download failed. "
+                        "Please try again later."
+                    )
+                }), 400
 
 
             source_files = [
@@ -1007,6 +1464,7 @@ def download_instagram():
                 ignore_errors=True
             )
 
+
         return response
 
 
@@ -1037,7 +1495,7 @@ def download_instagram():
     # ALL OTHER ERRORS
     # -----------------------------------------------------
 
-    except Exception:
+    except Exception as error:
 
         logger.exception(
             "Instagram download failed."
@@ -1047,6 +1505,19 @@ def download_instagram():
             temp_dir,
             ignore_errors=True
         )
+
+        if is_probable_rate_limit_error(
+            error
+        ):
+
+            return jsonify({
+                "success": False,
+                "message": (
+                    "Instagram is temporarily "
+                    "limiting requests. "
+                    "Please try again later."
+                )
+            }), 429
 
         return jsonify({
             "success": False,
