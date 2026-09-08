@@ -9,6 +9,11 @@ from urllib.parse import urlparse
 
 app = Flask(__name__)
 
+
+# =========================================================
+# CONFIG
+# =========================================================
+
 ALLOWED_HOSTS = {
     "instagram.com",
     "www.instagram.com",
@@ -25,11 +30,59 @@ COMMON_HEADERS = {
 }
 
 
+# =========================================================
+# SECURITY — SERVER SECRET
+# =========================================================
+
+BACKEND_API_SECRET = os.environ.get(
+    "BACKEND_API_SECRET",
+    ""
+)
+
+
+def is_authorized_request():
+    """
+    Only allow requests that contain our private
+    server-to-server secret.
+    """
+
+    if not BACKEND_API_SECRET:
+        return False
+
+    supplied_secret = (
+        request.headers.get("X-Backend-Secret")
+        or ""
+    )
+
+    return supplied_secret == BACKEND_API_SECRET
+
+
+def unauthorized_response():
+    return jsonify({
+        "success": False,
+        "message": "Unauthorized request."
+    }), 403
+
+
+# =========================================================
+# INSTAGRAM URL VALIDATION
+# =========================================================
+
 def is_valid_instagram_url(url):
+
     try:
+
         parsed = urlparse(url)
-        host = (parsed.hostname or "").lower()
-        path = parsed.path or ""
+
+        host = (
+            parsed.hostname
+            or ""
+        ).lower()
+
+        path = (
+            parsed.path
+            or ""
+        )
 
         return (
             parsed.scheme in {"http", "https"}
@@ -45,7 +98,12 @@ def is_valid_instagram_url(url):
         return False
 
 
+# =========================================================
+# YT-DLP
+# =========================================================
+
 def get_ydl_info(url):
+
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -55,17 +113,26 @@ def get_ydl_info(url):
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=False)
+
+        return ydl.extract_info(
+            url,
+            download=False
+        )
 
 
 def choose_audio_format(info):
-    formats = info.get("formats") or []
+
+    formats = (
+        info.get("formats")
+        or []
+    )
 
     audio_formats = []
 
     for fmt in formats:
-        acodec = fmt.get("acodec")
+
         media_url = fmt.get("url")
+        acodec = fmt.get("acodec")
 
         if (
             media_url
@@ -78,6 +145,7 @@ def choose_audio_format(info):
         return None
 
     def audio_score(fmt):
+
         abr = fmt.get("abr")
         tbr = fmt.get("tbr")
         asr = fmt.get("asr")
@@ -96,48 +164,105 @@ def choose_audio_format(info):
     return audio_formats[0]
 
 
+# =========================================================
+# CORS
+# NOTE:
+# We are not relying on CORS for security.
+# Secret authentication is the actual protection.
+# =========================================================
+
 @app.after_request
 def add_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+
+    response.headers[
+        "Access-Control-Allow-Origin"
+    ] = "*"
+
+    response.headers[
+        "Access-Control-Allow-Methods"
+    ] = "GET, POST, OPTIONS"
+
+    response.headers[
+        "Access-Control-Allow-Headers"
+    ] = "Content-Type, X-Backend-Secret"
+
     return response
 
 
-@app.route("/", methods=["GET"])
+# =========================================================
+# HEALTH CHECK
+# Public on purpose
+# =========================================================
+
+@app.route(
+    "/",
+    methods=["GET"]
+)
 def home():
+
     return jsonify({
         "status": "success",
         "message": "Instagram Downloader Backend is running."
     })
 
 
-@app.route("/api/resolve", methods=["GET", "POST", "OPTIONS"])
+# =========================================================
+# RESOLVE ENDPOINT
+# PROTECTED
+# =========================================================
+
+@app.route(
+    "/api/resolve",
+    methods=["GET", "POST", "OPTIONS"]
+)
 def resolve_instagram():
 
     if request.method == "OPTIONS":
         return Response(status=204)
 
+    # SECURITY CHECK
+    if not is_authorized_request():
+        return unauthorized_response()
+
+    # -----------------------------------------
+    # Read URL
+    # -----------------------------------------
+
     if request.method == "POST":
-        data = request.get_json(silent=True) or {}
+
+        data = (
+            request.get_json(
+                silent=True
+            )
+            or {}
+        )
+
         url = (
             data.get("url")
             or request.form.get("url")
             or ""
         ).strip()
+
     else:
+
         url = (
             request.args.get("url")
             or ""
         ).strip()
 
+    # -----------------------------------------
+    # Validate URL
+    # -----------------------------------------
+
     if not url:
+
         return jsonify({
             "success": False,
             "message": "Please enter an Instagram URL."
         }), 400
 
     if not is_valid_instagram_url(url):
+
         return jsonify({
             "success": False,
             "message": (
@@ -146,32 +271,55 @@ def resolve_instagram():
             )
         }), 400
 
+    # -----------------------------------------
+    # Resolve
+    # -----------------------------------------
+
     try:
+
         info = get_ydl_info(url)
 
-        formats = info.get("formats") or []
+        formats = (
+            info.get("formats")
+            or []
+        )
 
-        media_url = info.get("url")
+        media_url = info.get(
+            "url"
+        )
 
-        # If the main URL is missing, find a usable format.
+        # Fallback:
+        # find a usable media format
         if not media_url:
+
             usable = [
-                f for f in formats
-                if f.get("url")
-                and (
-                    f.get("vcodec") != "none"
-                    or f.get("acodec") != "none"
+                f
+                for f in formats
+                if (
+                    f.get("url")
+                    and (
+                        f.get("vcodec") != "none"
+                        or f.get("acodec") != "none"
+                    )
                 )
             ]
 
             if usable:
+
                 usable.sort(
-                    key=lambda f: float(f.get("tbr") or 0),
+                    key=lambda f: float(
+                        f.get("tbr")
+                        or 0
+                    ),
                     reverse=True
                 )
-                media_url = usable[0].get("url")
+
+                media_url = usable[0].get(
+                    "url"
+                )
 
         if not media_url:
+
             return jsonify({
                 "success": False,
                 "message": "No downloadable media was found."
@@ -187,6 +335,8 @@ def resolve_instagram():
         })
 
     except Exception:
+
+        # Do not expose internal yt-dlp errors
         return jsonify({
             "success": False,
             "message": (
@@ -197,8 +347,20 @@ def resolve_instagram():
         }), 400
 
 
-@app.route("/api/download", methods=["GET"])
+# =========================================================
+# DOWNLOAD ENDPOINT
+# PROTECTED
+# =========================================================
+
+@app.route(
+    "/api/download",
+    methods=["GET"]
+)
 def download_instagram():
+
+    # SECURITY CHECK
+    if not is_authorized_request():
+        return unauthorized_response()
 
     url = (
         request.args.get("url")
@@ -210,28 +372,46 @@ def download_instagram():
         or "mp3"
     ).lower()
 
+    # -----------------------------------------
+    # Basic validation
+    # -----------------------------------------
+
     if not url:
+
         return jsonify({
             "success": False,
             "message": "Please enter an Instagram URL."
         }), 400
 
     if not is_valid_instagram_url(url):
+
         return jsonify({
             "success": False,
             "message": "Invalid Instagram URL."
         }), 400
 
-    if file_format not in {"mp3", "mp4"}:
+    if file_format not in {
+        "mp3",
+        "mp4"
+    }:
+
         return jsonify({
             "success": False,
             "message": "Unsupported format."
         }), 400
 
+    # -----------------------------------------
+    # FFmpeg check
+    # -----------------------------------------
+
     if not shutil.which("ffmpeg"):
+
         return jsonify({
             "success": False,
-            "message": "FFmpeg is not available on the server."
+            "message": (
+                "Media conversion is temporarily "
+                "unavailable."
+            )
         }), 500
 
     temp_dir = tempfile.mkdtemp(
@@ -240,9 +420,9 @@ def download_instagram():
 
     try:
 
-        # =====================================
+        # =================================================
         # MP4
-        # =====================================
+        # =================================================
 
         if file_format == "mp4":
 
@@ -252,12 +432,13 @@ def download_instagram():
             )
 
             ydl_opts = {
+
                 "quiet": True,
+
                 "no_warnings": True,
+
                 "noplaylist": True,
 
-                # Best video+audio where possible,
-                # with combined-format fallback.
                 "format": "bv*+ba/b",
 
                 "merge_output_format": "mp4",
@@ -267,8 +448,13 @@ def download_instagram():
                 "http_headers": COMMON_HEADERS,
             }
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
+            with yt_dlp.YoutubeDL(
+                ydl_opts
+            ) as ydl:
+
+                ydl.download([
+                    url
+                ])
 
             mp4_files = glob.glob(
                 os.path.join(
@@ -278,6 +464,7 @@ def download_instagram():
             )
 
             if not mp4_files:
+
                 raise RuntimeError(
                     "MP4 file was not created."
                 )
@@ -291,29 +478,39 @@ def download_instagram():
                 download_name="instagram-video.mp4"
             )
 
-        # =====================================
+        # =================================================
         # MP3
-        # =====================================
+        # =================================================
 
         else:
 
-            # First inspect the available formats.
-            info = get_ydl_info(url)
+            # Get available formats
+            info = get_ydl_info(
+                url
+            )
 
-            audio_format = choose_audio_format(info)
+            audio_format = (
+                choose_audio_format(
+                    info
+                )
+            )
 
             if not audio_format:
+
                 raise RuntimeError(
-                    "No audio-capable Instagram format was found."
+                    "No audio-capable format was found."
                 )
 
-            format_id = audio_format.get(
-                "format_id"
+            format_id = (
+                audio_format.get(
+                    "format_id"
+                )
             )
 
             if not format_id:
+
                 raise RuntimeError(
-                    "Audio format ID was not available."
+                    "Audio format was unavailable."
                 )
 
             source_template = os.path.join(
@@ -322,28 +519,50 @@ def download_instagram():
             )
 
             ydl_opts = {
+
                 "quiet": True,
+
                 "no_warnings": True,
+
                 "noplaylist": True,
-                "format": str(format_id),
+
+                "format": str(
+                    format_id
+                ),
+
                 "outtmpl": source_template,
+
                 "http_headers": COMMON_HEADERS,
             }
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
+            with yt_dlp.YoutubeDL(
+                ydl_opts
+            ) as ydl:
+
+                ydl.download([
+                    url
+                ])
 
             source_files = [
-                f for f in glob.glob(
-                    os.path.join(temp_dir, "*")
+
+                f
+                for f in glob.glob(
+                    os.path.join(
+                        temp_dir,
+                        "*"
+                    )
                 )
+
                 if (
                     os.path.isfile(f)
                     and not f.endswith(".part")
+                    and not f.endswith(".mp3")
                 )
+
             ]
 
             if not source_files:
+
                 raise RuntimeError(
                     "Audio source was not downloaded."
                 )
@@ -355,36 +574,52 @@ def download_instagram():
                 "instagram-audio.mp3"
             )
 
-            # Extract audio directly with FFmpeg.
             ffmpeg_command = [
+
                 "ffmpeg",
+
                 "-y",
+
                 "-i",
                 source_file,
+
                 "-map",
                 "0:a:0",
+
                 "-vn",
+
                 "-codec:a",
                 "libmp3lame",
+
                 "-b:a",
                 "192k",
+
                 mp3_file,
             ]
 
             process = subprocess.run(
+
                 ffmpeg_command,
+
                 stdout=subprocess.PIPE,
+
                 stderr=subprocess.PIPE,
+
                 text=True,
+
                 timeout=120,
             )
 
             if process.returncode != 0:
+
                 raise RuntimeError(
-                    process.stderr[-4000:]
+                    "Audio conversion failed."
                 )
 
-            if not os.path.exists(mp3_file):
+            if not os.path.exists(
+                mp3_file
+            ):
+
                 raise RuntimeError(
                     "MP3 file was not created."
                 )
@@ -396,8 +631,13 @@ def download_instagram():
                 download_name="instagram-audio.mp3"
             )
 
+        # -----------------------------------------
+        # Cleanup after response closes
+        # -----------------------------------------
+
         @response.call_on_close
         def cleanup():
+
             shutil.rmtree(
                 temp_dir,
                 ignore_errors=True
@@ -414,10 +654,13 @@ def download_instagram():
 
         return jsonify({
             "success": False,
-            "message": "Audio conversion timed out."
+            "message": (
+                "Media processing timed out. "
+                "Please try again."
+            )
         }), 500
 
-    except Exception as e:
+    except Exception:
 
         shutil.rmtree(
             temp_dir,
@@ -426,10 +669,17 @@ def download_instagram():
 
         return jsonify({
             "success": False,
-            "message": "Download failed.",
-            "error": str(e)
+            "message": (
+                "Download failed. "
+                "The media may be unavailable "
+                "or temporarily unsupported."
+            )
         }), 400
 
+
+# =========================================================
+# START
+# =========================================================
 
 if __name__ == "__main__":
 
