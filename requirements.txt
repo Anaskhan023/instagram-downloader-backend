@@ -1,4 +1,3 @@
 Flask
 gunicorn
-yt-dlp>=2026.08.19
 requests
